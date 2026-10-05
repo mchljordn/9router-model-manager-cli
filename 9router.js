@@ -1,11 +1,7 @@
 #!/usr/bin/env node
-// 9router DB CRUD CLI — manages combos, providers, models in the 9router SQLite DB.
-// Zero deps beyond better-sqlite3 (resolved from the 9router runtime install).
-
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
-const { execFileSync } = require('child_process');
 
 function getDefaultAppDir() {
   const home = os.homedir();
@@ -24,6 +20,16 @@ const RUNTIME = process.env.NR_RUNTIME || path.join(APPDATA, '9router', 'runtime
 const API_URL = process.env.NR_API || 'http://localhost:20128';
 
 let db;
+const stmts = new Map();
+
+function query(sql) {
+  let s = stmts.get(sql);
+  if (!s) {
+    s = db.prepare(sql);
+    stmts.set(sql, s);
+  }
+  return s;
+}
 
 function loadDatabase() {
   try {
@@ -54,69 +60,77 @@ function initDb(dbPath = process.env.NR_DB || DB_PATH) {
   const Database = loadDatabase();
   db = new Database(dbPath, { readonly: false });
   db.pragma('journal_mode = WAL');
+  stmts.clear();
   return db;
 }
 
-// ── Helpers ────────────────────────────────────────────────────────────────────
 function fail(msg) { console.error('error: ' + msg); process.exit(1); }
 function now() { return new Date().toISOString(); }
+
 function getCombo(name) {
-  const row = db.prepare('SELECT id, name, kind, models, createdAt, updatedAt FROM combos WHERE name = ?').get(name);
+  const row = query('SELECT id, name, kind, models, createdAt, updatedAt FROM combos WHERE name = ?').get(name);
   if (!row) fail(`combo "${name}" not found`);
   row.models = JSON.parse(row.models);
   return row;
 }
+
 function saveCombo(combo, models) {
   const next = [...new Set(models)].sort();
-  db.prepare('UPDATE combos SET models = ?, updatedAt = ? WHERE id = ?')
+  query('UPDATE combos SET models = ?, updatedAt = ? WHERE id = ?')
     .run(JSON.stringify(next), now(), combo.id);
   return next;
 }
+
 function countByPrefix(models) {
   const m = new Map();
   for (const id of models) {
-    const p = id.includes('/') ? id.split('/')[0] : id;
+    const slash = id.indexOf('/');
+    const p = slash !== -1 ? id.slice(0, slash) : id;
     m.set(p, (m.get(p) || 0) + 1);
   }
   return [...m.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
 }
-function apiModels() {
-  const raw = httpGetSync(API_URL + '/v1/models');
-  if (!raw) fail(`no response from API at ${API_URL} — is the 9router server running?`);
+
+async function apiModels() {
+  let res;
+  try {
+    res = await fetch(API_URL + '/v1/models', { signal: AbortSignal.timeout(20000) });
+  } catch {
+    fail(`no response from API at ${API_URL} — is the 9router server running?`);
+  }
+  if (!res.ok) fail(`API returned HTTP ${res.status}`);
   let j;
-  try { j = JSON.parse(raw); } catch { fail(`unparseable API response (first 120 chars): ${raw.slice(0, 120)}`); }
+  try {
+    j = await res.json();
+  } catch {
+    fail(`unparseable API response`);
+  }
   const list = (j.data || j.models || []).map(x => x.id).filter(Boolean);
   if (!list.length) fail('API returned an empty model list');
   return list;
 }
-function httpGetSync(url) {
-  const code = `require("http").get(${JSON.stringify(url)},r=>{let d="";r.on("data",c=>d+=c);r.on("end",()=>process.stdout.write(d))}).on("error",()=>process.stdout.write(""))`;
-  try {
-    return execFileSync(process.execPath, ['-e', code], { encoding: 'utf8', maxBuffer: 1 << 28, timeout: 20000 });
-  } catch {
-    return '';
-  }
-}
+
 function bold(s) { return '\x1b[1m' + s + '\x1b[0m'; }
 function dim(s) { return '\x1b[2m' + s + '\x1b[0m'; }
 
-// ── Commands ───────────────────────────────────────────────────────────────────
 function ts(v) {
   if (!v) return '-';
-  // app stores ISO strings; our own writes also use ISO
   if (typeof v === 'string' && /^\d{4}-/.test(v)) return v.slice(0, 10);
   const d = new Date(v);
   return isNaN(d.getTime()) ? String(v) : d.toISOString().slice(0, 10);
 }
+
 function tsFull(v) {
   if (!v) return '-';
   if (typeof v === 'string' && /^\d{4}-/.test(v)) return v.slice(0, 19).replace('T', ' ');
   const d = new Date(v);
   return isNaN(d.getTime()) ? String(v) : d.toISOString().slice(0, 19).replace('T', ' ');
 }
+
 function listCombos() {
-  const rows = db.prepare('SELECT name, kind, models, updatedAt FROM combos ORDER BY name').all();
-  const w = Math.max(...rows.map(r => r.name.length));
+  const rows = query('SELECT name, kind, models, updatedAt FROM combos ORDER BY name').all();
+  if (!rows.length) { console.log(dim('0 combos')); return; }
+  const w = Math.max(...rows.map(r => r.name.length), 4);
   for (const r of rows) {
     const n = JSON.parse(r.models).length;
     console.log(`${bold(r.name.padEnd(w))}  ${String(n).padStart(4)}  ${dim(r.kind || 'custom')}  ${ts(r.updatedAt)}`);
@@ -135,18 +149,18 @@ function showCombo(name) {
 }
 
 function createCombo(name, modelsArg, kind = 'custom') {
-  const exists = db.prepare('SELECT id FROM combos WHERE name = ?').get(name);
+  const exists = query('SELECT id FROM combos WHERE name = ?').get(name);
   if (exists) fail(`combo "${name}" already exists — use add/remove to edit`);
   const models = [...new Set(modelsArg.split(',').map(s => s.trim()).filter(Boolean))];
-  const id = 'combo-' + name.toLowerCase().replace(/[^a-z0-9]+/g, '-') + '-' + now().toString(36);
-  db.prepare('INSERT INTO combos (id, name, kind, models, createdAt, updatedAt) VALUES (?,?,?,?,?,?)')
+  const id = 'combo-' + name.toLowerCase().replace(/[^a-z0-9]+/g, '-') + '-' + Date.now().toString(36);
+  query('INSERT INTO combos (id, name, kind, models, createdAt, updatedAt) VALUES (?,?,?,?,?,?)')
     .run(id, name, kind, JSON.stringify(models.sort()), now(), now());
   console.log(`created ${bold(name)} with ${models.length} models`);
 }
 
 function deleteCombo(name) {
   const c = getCombo(name);
-  db.prepare('DELETE FROM combos WHERE id = ?').run(c.id);
+  query('DELETE FROM combos WHERE id = ?').run(c.id);
   console.log(`deleted ${bold(name)} (${c.models.length} models)`);
 }
 
@@ -177,45 +191,46 @@ function removePrefix(name, prefix) {
 }
 
 function purgeModel(model) {
-  const rows = db.prepare('SELECT id, name, models FROM combos').all();
+  const rows = query('SELECT id, name, models FROM combos WHERE models LIKE ?').all(`%${model}%`);
   let hit = 0;
-  for (const r of rows) {
-    const m = JSON.parse(r.models);
-    if (m.includes(model)) {
-      saveCombo(r, m.filter(x => x !== model));
-      hit++;
+  const updateStmt = query('UPDATE combos SET models = ?, updatedAt = ? WHERE id = ?');
+  const runTx = db.transaction((targets) => {
+    for (const r of targets) {
+      const m = JSON.parse(r.models);
+      if (m.includes(model)) {
+        updateStmt.run(JSON.stringify(m.filter(x => x !== model)), now(), r.id);
+        hit++;
+      }
     }
-  }
+  });
+  runTx(rows);
   console.log(`purged ${bold(model)} from ${hit} combo(s)`);
 }
 
-function searchModels(query) {
-  const q = query.toLowerCase();
-  const rows = db.prepare('SELECT name, models FROM combos ORDER BY name').all();
+function searchModels(queryStr) {
+  const q = queryStr.toLowerCase();
+  const rows = query('SELECT models FROM combos WHERE models LIKE ?').all(`%${queryStr}%`);
   const seen = new Set();
-  let total = 0;
   for (const r of rows) {
-    const hits = JSON.parse(r.models).filter(m => m.toLowerCase().includes(q));
-    for (const m of hits) {
-      if (seen.has(m)) continue;
-      seen.add(m);
-      total++;
+    for (const m of JSON.parse(r.models)) {
+      if (m.toLowerCase().includes(q)) seen.add(m);
     }
   }
   const sorted = [...seen].sort();
   for (const m of sorted) console.log('  ' + m);
-  console.log(dim(`\n${total} unique models match "${query}"`));
+  console.log(dim(`\n${sorted.length} unique models match "${queryStr}"`));
 }
 
 function whereModel(model) {
-  const rows = db.prepare('SELECT name, models FROM combos ORDER BY name').all();
+  const rows = query('SELECT name, models FROM combos WHERE models LIKE ? ORDER BY name').all(`%${model}%`);
   const inCombos = rows.filter(r => JSON.parse(r.models).includes(model)).map(r => r.name);
   if (!inCombos.length) { console.log(dim(`"${model}" is not in any combo`)); return; }
   console.log(`${bold(model)} is in: ${inCombos.join(', ')}`);
 }
 
 function listProviders() {
-  const nodes = db.prepare('SELECT id, name, data, updatedAt FROM providerNodes ORDER BY name').all();
+  const nodes = query('SELECT id, name, data, updatedAt FROM providerNodes ORDER BY name').all();
+  if (!nodes.length) { console.log(dim('0 provider nodes')); return; }
   const w = Math.max(...nodes.map(n => n.name.length), 8);
   for (const n of nodes) {
     let prefix = '', apiType = '';
@@ -225,9 +240,9 @@ function listProviders() {
   console.log(dim(`\n${nodes.length} provider nodes`));
 }
 
-function comboStats(name) {
+async function comboStats(name) {
   const c = getCombo(name);
-  const api = apiModels();
+  const api = await apiModels();
   const apiSet = new Set(api);
   const dead = c.models.filter(m => !apiSet.has(m));
   const missing = api.filter(m => !c.models.includes(m));
@@ -243,19 +258,18 @@ function comboStats(name) {
   console.log(`  ${dim(`in API but not combo: ${missing.length}`)}`);
 }
 
-function syncCombo(name) {
+async function syncCombo(name) {
   const c = getCombo(name);
-  const api = apiModels();
+  const api = await apiModels();
   const apiSet = new Set(api);
   const before = c.models.length;
-  // drop dead models, keep order
   const kept = c.models.filter(m => apiSet.has(m));
   const next = saveCombo(c, kept);
   console.log(`${bold(name)}: ${before} -> ${next.length} (-${before - next.length} dead removed)`);
 }
 
-function listApiModels(filter) {
-  const api = apiModels();
+async function listApiModels(filter) {
+  const api = await apiModels();
   const f = filter ? filter.toLowerCase() : null;
   const rows = f ? api.filter(m => m.toLowerCase().includes(f)) : api;
   const groups = countByPrefix(rows);
@@ -275,7 +289,7 @@ function importCombo(file, name) {
   const payload = JSON.parse(fs.readFileSync(file, 'utf8'));
   const target = name || payload.name;
   if (!target) fail('no name given (arg or "name" field in file)');
-  const exists = db.prepare('SELECT id FROM combos WHERE name = ?').get(target);
+  const exists = query('SELECT id FROM combos WHERE name = ?').get(target);
   if (exists) {
     addModels(target, (payload.models || []).join(','));
     console.log(dim(`merged into existing ${target}`));
@@ -285,10 +299,10 @@ function importCombo(file, name) {
 }
 
 function dbInfo() {
-  const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map(t => t.name);
-  const combos = db.prepare('SELECT count(*) n FROM combos').get().n;
-  const nodes = db.prepare('SELECT count(*) n FROM providerNodes').get().n;
-  const conns = db.prepare('SELECT count(*) n FROM providerConnections').get().n;
+  const tables = query("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map(t => t.name);
+  const combos = query('SELECT count(*) n FROM combos').get().n;
+  const nodes = query('SELECT count(*) n FROM providerNodes').get().n;
+  const conns = query('SELECT count(*) n FROM providerConnections').get().n;
   console.log(bold('9router DB') + dim(`  ${DB_PATH}`));
   console.log(`  combos:            ${combos}`);
   console.log(`  provider nodes:    ${nodes}`);
@@ -296,11 +310,7 @@ function dbInfo() {
   console.log(`  tables:            ${tables.join(', ')}`);
 }
 
-function ping(target, flags) {
-  const https = require('https');
-  const http = require('http');
-
-  // parse flags
+async function ping(target, flags) {
   const direct = flags.includes('--direct');
   const failuresOnly = flags.includes('--failures');
   const limitIdx = flags.indexOf('--limit');
@@ -311,48 +321,49 @@ function ping(target, flags) {
   const concurrency = concIdx >= 0 ? parseInt(flags[concIdx + 1]) : 3;
   const purgeFlag = flags.includes('--purge');
 
-  // ── resolve target to model list ───────────────────────────────────────────
-  const combos = db.prepare('SELECT name, models FROM combos').all();
-  const nodes = db.prepare('SELECT id, name, data FROM providerNodes').all();
-
-  // check if target is a combo name
-  const comboMatch = combos.find(c => c.name === target);
-  // check if target is a provider prefix or node name
-  const prefixMatch = nodes.find(n => {
-    try { const d = JSON.parse(n.data); return d.prefix === target || n.name === target; } catch { return false; }
-  });
-  // check if target is a model id
-  const allModelsSet = new Set();
-  const modelInCombos = {};
-  for (const c of combos) {
-    for (const m of JSON.parse(c.models)) {
-      allModelsSet.add(m);
-      if (!modelInCombos[m]) modelInCombos[m] = [];
-      modelInCombos[m].push(c.name);
-    }
-  }
-  const isExactModel = allModelsSet.has(target);
-
   let models = [];
   let mode = '';
-  if (comboMatch) {
-    models = JSON.parse(comboMatch.models);
+
+  const comboRow = query('SELECT models FROM combos WHERE name = ?').get(target);
+  let nodes = null;
+  if (comboRow) {
+    models = JSON.parse(comboRow.models);
     mode = `combo:${target}`;
-  } else if (prefixMatch) {
-    let pfx;
-    try { pfx = JSON.parse(prefixMatch.data).prefix || prefixMatch.name; } catch { pfx = prefixMatch.name; }
-    models = [...allModelsSet].filter(m => m.startsWith(pfx + '/'));
-    mode = `provider:${target}`;
-  } else if (isExactModel) {
-    models = [target];
-    mode = `model:${target}`;
-  } else if (target) {
-    // fuzzy: treat as prefix substring
-    models = [...allModelsSet].filter(m => m.startsWith(target + '/') || m.startsWith(target));
-    if (!models.length) fail(`"${target}" is not a combo, provider, or model id`);
-    mode = `prefix:${target}`;
   } else {
-    fail('ping requires a target: <combo|provider|model>');
+    nodes = query('SELECT id, name, data FROM providerNodes').all();
+    const prefixMatch = nodes.find(n => {
+      try { const d = JSON.parse(n.data); return d.prefix === target || n.name === target; } catch { return false; }
+    });
+
+    if (prefixMatch) {
+      let pfx;
+      try { pfx = JSON.parse(prefixMatch.data).prefix || prefixMatch.name; } catch { pfx = prefixMatch.name; }
+      const matched = new Set();
+      for (const r of query('SELECT models FROM combos WHERE models LIKE ?').all(`%"${pfx}/%`)) {
+        for (const m of JSON.parse(r.models)) {
+          if (m.startsWith(pfx + '/')) matched.add(m);
+        }
+      }
+      models = [...matched];
+      mode = `provider:${target}`;
+    } else {
+      const matchRow = query('SELECT models FROM combos WHERE models LIKE ?').all(`%${target}%`);
+      const matched = new Set();
+      for (const r of matchRow) {
+        for (const m of JSON.parse(r.models)) {
+          if (m === target || m.startsWith(target + '/') || m.startsWith(target)) matched.add(m);
+        }
+      }
+      if (matched.has(target)) {
+        models = [target];
+        mode = `model:${target}`;
+      } else if (matched.size > 0) {
+        models = [...matched];
+        mode = `prefix:${target}`;
+      } else {
+        fail(`"${target}" is not a combo, provider, or model id`);
+      }
+    }
   }
 
   if (limit < Infinity) models = models.slice(0, limit);
@@ -361,29 +372,24 @@ function ping(target, flags) {
   console.log(dim(`ping ${mode}  ${models.length} models  ${direct ? 'direct' : 'via 9router'}  timeout=${timeoutMs}ms  concurrency=${concurrency}`));
   console.log();
 
-  // ── http helper (async, handles http + https) ───────────────────────────────
-  function doRequest(url, method, headers, body) {
-    return new Promise((resolve) => {
-      const mod = url.startsWith('https') ? https : http;
-      const data = body ? JSON.stringify(body) : null;
-      if (data) headers['Content-Length'] = Buffer.byteLength(data);
-      const r = mod.request(url, { method: method || 'GET', headers }, (res) => {
-        let s = '';
-        res.on('data', c => s += c);
-        res.on('end', () => resolve({ status: res.statusCode, body: s }));
+  async function doRequest(url, method, headers, body) {
+    try {
+      const res = await fetch(url, {
+        method: method || 'GET',
+        headers,
+        body: body ? JSON.stringify(body) : undefined,
+        signal: AbortSignal.timeout(timeoutMs)
       });
-      r.on('error', e => resolve({ status: 0, body: e.message }));
-      r.setTimeout(timeoutMs, () => { r.destroy(); resolve({ status: 0, body: 'TIMEOUT' }); });
-      if (data) r.write(data);
-      r.end();
-    });
+      const text = await res.text();
+      return { status: res.status, body: text };
+    } catch (e) {
+      const isTimeout = e.name === 'TimeoutError' || e.code === 23;
+      return { status: 0, body: isTimeout ? 'TIMEOUT' : e.message };
+    }
   }
 
-  // ── build pinger based on mode ──────────────────────────────────────────────
   function makeViaRouter(modelId) {
-    // use first active apiKey
-    
-    const keyRow = db.prepare("SELECT key FROM apiKeys WHERE isActive=1 ORDER BY createdAt LIMIT 1").get();
+    const keyRow = query("SELECT key FROM apiKeys WHERE isActive=1 ORDER BY createdAt LIMIT 1").get();
     if (!keyRow) fail('no active apiKey found in DB — check apiKeys table');
     const key = keyRow.key;
     return async () => {
@@ -406,7 +412,7 @@ function ping(target, flags) {
   }
 
   function makeDirectPinger(modelId) {
-    // find the prefix
+    if (!nodes) nodes = query('SELECT id, name, data FROM providerNodes').all();
     const pfx = modelId.includes('/') ? modelId.split('/')[0] : null;
     if (!pfx) return null;
     const node = nodes.find(n => { try { return JSON.parse(n.data).prefix === pfx; } catch { return false; } });
@@ -415,8 +421,7 @@ function ping(target, flags) {
     try { nodeData = JSON.parse(node.data); } catch { return null; }
     const baseUrl = nodeData.baseUrl?.replace(/\/$/, '');
     if (!baseUrl) return null;
-    // find matching connection for this node
-    const conn = db.prepare("SELECT data FROM providerConnections WHERE provider=? AND isActive=1 ORDER BY priority LIMIT 1").get(node.id);
+    const conn = query("SELECT data FROM providerConnections WHERE provider=? AND isActive=1 ORDER BY priority LIMIT 1").get(node.id);
     if (!conn) return null;
     let connData;
     try { connData = JSON.parse(conn.data); } catch { return null; }
@@ -426,7 +431,7 @@ function ping(target, flags) {
     const apiType = nodeData.apiType || 'chat';
 
     return async () => {
-      let url, headers, body, res, ok = false, note = '';
+      let url, headers, body;
       headers = { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key };
       if (apiType === 'responses') {
         url = baseUrl + '/responses';
@@ -440,7 +445,8 @@ function ping(target, flags) {
         url = baseUrl + '/chat/completions';
         body = { model: rawModel, messages: [{ role: 'user', content: 'ping' }], max_tokens: 8, stream: false };
       }
-      res = await doRequest(url, 'POST', headers, body);
+      const res = await doRequest(url, 'POST', headers, body);
+      let ok = false, note = '';
       try {
         const j = JSON.parse(res.body);
         if (res.status === 200) {
@@ -462,79 +468,78 @@ function ping(target, flags) {
     };
   }
 
-  // ── run with concurrency ────────────────────────────────────────────────────
-  async function run() {
-    const results = [];
-    let i = 0;
-    async function next() {
-      while (i < models.length) {
-        const modelId = models[i++];
-        const pinger = direct ? makeDirectPinger(modelId) : makeViaRouter(modelId);
-        if (!pinger) {
-          results.push({ modelId, ok: false, status: 0, ms: 0, note: direct ? 'no direct config (node/connection not found)' : 'pinger init failed' });
-          if (!failuresOnly) console.log(`${dim('SKIP')} ${dim('---')}     ${modelId}  ${dim('no direct config')}`);
-          continue;
-        }
-        const t0 = Date.now();
-        let r;
-        try { r = await pinger(); } catch (e) { r = { ok: false, status: 0, note: e.message }; }
-        const ms = Date.now() - t0;
-        results.push({ modelId, ...r, ms });
-        if (!failuresOnly || !r.ok) {
-          const tag = r.ok ? '\x1b[32mOK  \x1b[0m' : '\x1b[31mFAIL\x1b[0m';
-          const latency = String(ms + 'ms').padStart(7);
-          const statusStr = String(r.status).padStart(3);
-          console.log(`${tag} ${statusStr} ${latency}  ${modelId}  ${dim(r.note || '')}`);
-        }
+  const results = [];
+  let i = 0;
+  async function next() {
+    while (i < models.length) {
+      const modelId = models[i++];
+      const pinger = direct ? makeDirectPinger(modelId) : makeViaRouter(modelId);
+      if (!pinger) {
+        results.push({ modelId, ok: false, status: 0, ms: 0, note: direct ? 'no direct config (node/connection not found)' : 'pinger init failed' });
+        if (!failuresOnly) console.log(`${dim('SKIP')} ${dim('---')}     ${modelId}  ${dim('no direct config')}`);
+        continue;
+      }
+      const t0 = Date.now();
+      let r;
+      try { r = await pinger(); } catch (e) { r = { ok: false, status: 0, note: e.message }; }
+      const ms = Date.now() - t0;
+      results.push({ modelId, ...r, ms });
+      if (!failuresOnly || !r.ok) {
+        const tag = r.ok ? '\x1b[32mOK  \x1b[0m' : '\x1b[31mFAIL\x1b[0m';
+        const latency = String(ms + 'ms').padStart(7);
+        const statusStr = String(r.status).padStart(3);
+        console.log(`${tag} ${statusStr} ${latency}  ${modelId}  ${dim(r.note || '')}`);
       }
     }
-    await Promise.all(Array.from({ length: Math.min(concurrency, models.length) }, next));
-
-    // summary
-    const ok = results.filter(r => r.ok);
-    const fail = results.filter(r => !r.ok);
-    console.log();
-    console.log(bold(`${ok.length}/${results.length} OK`) + (fail.length ? `  ${fail.length} failed` : ''));
-
-    // --purge
-    if (purgeFlag && fail.length) {
-      const readline = require('readline');
-      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-      const failIds = fail.map(r => r.modelId);
-      rl.question(`\nPurge ${fail.length} failing model(s) from all combos? [y/N] `, (ans) => {
-        rl.close();
-        if (ans.toLowerCase() === 'y') {
-          backup();
-          for (const m of failIds) purgeModel(m);
-          console.log(dim(`purged ${failIds.length} models`));
-        } else {
-          console.log(dim('skipped purge'));
-        }
-        if (fail.length) process.exit(1);
-      });
-    } else {
-      if (fail.length) process.exit(1);
-    }
   }
+  await Promise.all(Array.from({ length: Math.min(concurrency, models.length) }, next));
 
-  run().catch(e => fail(e.message));
+  const ok = results.filter(r => r.ok);
+  const failList = results.filter(r => !r.ok);
+  console.log();
+  console.log(bold(`${ok.length}/${results.length} OK`) + (failList.length ? `  ${failList.length} failed` : ''));
+
+  if (purgeFlag && failList.length) {
+    const readline = require('readline');
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const failIds = failList.map(r => r.modelId);
+    rl.question(`\nPurge ${failList.length} failing model(s) from all combos? [y/N] `, async (ans) => {
+      rl.close();
+      if (ans.toLowerCase() === 'y') {
+        await backup();
+        for (const m of failIds) purgeModel(m);
+        console.log(dim(`purged ${failIds.length} models`));
+      } else {
+        console.log(dim('skipped purge'));
+      }
+      process.exit(1);
+    });
+  } else if (failList.length) {
+    process.exit(1);
+  }
 }
 
-function backup(file) {
+async function backup(file) {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
   let dest = file || path.join(process.cwd(), `9router-backup-${stamp}.sqlite`);
   try {
-    fs.copyFileSync(DB_PATH, dest);
+    if (db && typeof db.backup === 'function') {
+      await db.backup(dest);
+    } else {
+      fs.copyFileSync(DB_PATH, dest);
+    }
   } catch (e) {
-    if (file) fail(`cannot write backup to ${file}: ${e.code}`);
-    // cwd not writable (e.g. C:\) — fall back to temp
-    dest = path.join(require('os').tmpdir(), `9router-backup-${stamp}.sqlite`);
-    fs.copyFileSync(DB_PATH, dest);
+    if (file) fail(`cannot write backup to ${file}: ${e.code || e.message}`);
+    dest = path.join(os.tmpdir(), `9router-backup-${stamp}.sqlite`);
+    if (db && typeof db.backup === 'function') {
+      await db.backup(dest);
+    } else {
+      fs.copyFileSync(DB_PATH, dest);
+    }
   }
   console.log(`backed up DB -> ${dest}`);
 }
 
-// ── CLI ────────────────────────────────────────────────────────────────────────
 const USAGE = `9router Model Manager CLI
 
 Usage: r9 <command> [args]
@@ -579,7 +584,7 @@ Env overrides:
   NR_API      base URL of the 9router API (default http://localhost:20128)
 `;
 
-function main() {
+async function main() {
   const [cmd, ...args] = process.argv.slice(2);
   if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') { console.log(USAGE); return; }
   if (cmd === '--version' || cmd === '-v') {
@@ -593,8 +598,8 @@ function main() {
   switch (cmd) {
     case 'list': case 'ls': return listCombos();
     case 'show': return showCombo(args[0]);
-    case 'stats': return comboStats(args[0]);
-    case 'sync': return syncCombo(args[0]);
+    case 'stats': return await comboStats(args[0]);
+    case 'sync': return await syncCombo(args[0]);
     case 'create': return createCombo(args[0], args[1], args[2]);
     case 'delete': return deleteCombo(args[0]);
     case 'add': return addModels(args[0], args[1]);
@@ -605,17 +610,17 @@ function main() {
     case 'search': return searchModels(args[0]);
     case 'where': return whereModel(args[0]);
     case 'purge': return purgeModel(args[0]);
-    case 'api': return listApiModels(args[0]);
+    case 'api': return await listApiModels(args[0]);
     case 'providers': return listProviders();
-    case 'ping': return ping(args[0], args.slice(1));
+    case 'ping': return await ping(args[0], args.slice(1));
     case 'info': return dbInfo();
-    case 'backup': return backup(args[0]);
+    case 'backup': return await backup(args[0]);
     default: fail(`unknown command: ${cmd}\n\n${USAGE}`);
   }
 }
 
 if (require.main === module) {
-  main();
+  main().catch(e => fail(e.message));
 }
 
 module.exports = {

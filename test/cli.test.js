@@ -111,8 +111,28 @@ test('create, modify, search, and delete combo', () => {
   const purgeWhere = runCli('where', 'meta/llama-3');
   assert.match(purgeWhere, /is not in any combo/);
 
+  runCli('add', 'tier-mini', 'mistral/large,mistral/small');
+  runCli('rmprefix', 'tier-mini', 'mistral/');
+  const rmPrefixShow = runCli('show', 'tier-mini');
+  assert.doesNotMatch(rmPrefixShow, /mistral\//);
+
   runCli('delete', 'tier-mini');
   assert.throws(() => runCli('show', 'tier-mini'));
+});
+
+test('providers command lists provider nodes', () => {
+  const r9 = require('../9router.js');
+  const Database = r9.loadDatabase();
+  const db = new Database(testDb);
+  db.prepare(`
+    INSERT INTO providerNodes (id, name, data, createdAt, updatedAt)
+    VALUES ('p1', 'openai-direct', '{"prefix":"openai","apiType":"chat"}', '2026-01-01', '2026-01-01')
+  `).run();
+  db.close();
+
+  const out = runCli('providers');
+  assert.match(out, /openai-direct/);
+  assert.match(out, /prefix=openai/);
 });
 
 test('export and import combo', () => {
