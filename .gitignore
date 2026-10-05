@@ -1,0 +1,9 @@
+node_modules/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+9router-backup-*.sqlite
+.DS_Store
+Thumbs.db
+*.log

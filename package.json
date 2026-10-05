@@ -1,0 +1,30 @@
+{
+  "name": "9router-model-manager-cli",
+  "version": "1.0.0",
+  "description": "9router Model Manager CLI — manage combos, models, providers, ping, and backups",
+  "main": "9router.js",
+  "bin": {
+    "r9": "./9router.js",
+    "9router": "./9router.js",
+    "9router-mm": "./9router.js"
+  },
+  "scripts": {
+    "test": "node --test test/cli.test.js"
+  },
+  "keywords": [
+    "9router",
+    "llm",
+    "router",
+    "ai",
+    "sqlite",
+    "cli"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "optionalDependencies": {
+    "better-sqlite3": "^11.8.1"
+  }
+}
