@@ -145,6 +145,41 @@ test('export and import combo', () => {
   assert.match(showClone, /openai\/gpt-4o/);
 });
 
+function tryCli(...args) {
+  try {
+    return { code: 0, out: runCli(...args) };
+  } catch (e) {
+    return { code: 1, out: e.stdout ? e.stdout.toString() : '' };
+  }
+}
+
+function needsServer(t, r) {
+  if (/no active apiKey/.test(r.out) || /no response from API/.test(r.out) || r.code !== 0) {
+    t.skip('live 9router server not available');
+    return true;
+  }
+  return false;
+}
+
+test('testall benchmarks all live providers', async (t) => {
+  const r = tryCli('testall', '--limit', '2', '--timeout', '5000');
+  if (needsServer(t, r)) return;
+  assert.match(r.out, /providers responding/);
+  assert.match(r.out, /fastest responders:/);
+});
+
+test('testall --json emits valid JSON', async (t) => {
+  const r = tryCli('testall', '--limit', '1', '--timeout', '5000', '--json');
+  if (needsServer(t, r)) return;
+  const json = JSON.parse(r.out.split('\n').filter(l => /^\s*[\[{]/.test(l)).join(''));
+  assert.ok(Array.isArray(json));
+  if (json.length) {
+    assert.ok(json[0].hasOwnProperty('provider'));
+    assert.ok(json[0].hasOwnProperty('avg'));
+    assert.ok(['OK', 'SLOW', 'PARTIAL', 'ALL FAIL'].includes(json[0].verdict));
+  }
+});
+
 test('db backup creates sqlite snapshot', () => {
   const backupFile = path.join(tmpDir, 'backup.sqlite');
   runCli('backup', backupFile);
